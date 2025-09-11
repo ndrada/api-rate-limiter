@@ -3,6 +3,7 @@ package main
 
 //import http, logging, contect packs and rate limiter
 import (
+	"context"  // to set a per-req wait deadline
 	"log"      //for simple logging of server start and errors
 	"math"     //for Floor/Ceil on token math
 	"net"      //to extract remote ip
@@ -19,6 +20,12 @@ import (
 const (
 	perClientRPS   = 5  //steady tokens/sec
 	perClientBurst = 10 //burst capacity
+)
+
+// behavior toggle
+var (
+	useBlocking = true
+	maxWait     = 300 * time.Millisecond //cap for length of wait per req
 )
 
 // store the limiter & when traffic was last seen for each client
@@ -123,54 +130,66 @@ func keyFromRequest(r *http.Request) string {
 	return "ip:" + host
 }
 
-// this now uses per client store instead of global
-// also sets useful response headers
-/*
-	- X-RateLimite-Limit : configured steady rate (req/sec)
-	- X-RateLimmit-Remaining: approx tokens left in bucket (rounded down)
-	- Retry-After (only on 429) : time to wait before retry8ing
-*/
+// helper: set standard rate limit headers on the response
+func setRateHeaders(w http.ResponseWriter, tokens float64) {
+	if tokens < 0 {
+		tokens = 0
+	}
+	w.Header().Set("X-RateLimit-Limit", strconv.Itoa(perClientRPS))
+	w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(int(math.Floor(tokens))))
+}
+
+// helper: estimate time to wiat for 1 token based on current tokens
+func retryAfterSeconds(tokens float64) int {
+	need := 1 - tokens
+	if need < 0 {
+		need = 0
+	}
+	if perClientRPS <= 0 {
+		return 1
+	}
+	sec := int(math.Ceil(need / float64(perClientRPS)))
+	if sec < 1 {
+		sec = 1
+	}
+	return sec
+}
+
+// middleware: per client limiter w/ 2 behaviors (blockking or fail-fast)
+// + headers (success & 429)
 func rateLimitMiddleware(store *limiterStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := keyFromRequest(r)     //figure out which client this req belongs to
-		lim := store.get(key)        //fetch or create limiter for client
-		tokensBefore := lim.Tokens() //grab current token estimate beofre making decision
-		allowed := lim.Allow()       //try to consume 1 token (non-blocking)
+		key := keyFromRequest(r) //figure out which client this req belongs to
+		lim := store.get(key)    //fetch or create limiter for client
 
-		//compute approx remaining tokens no for headers
-		remaining := tokensBefore
-		if allowed {
-			remaining = tokensBefore - 1
-			if remaining < 0 {
-				remaining = 0
+		//blocking mode
+		if useBlocking {
+			tokensBefore := lim.Tokens()                             //grab current token estimate beofre making decision
+			ctx, cancel := context.WithTimeout(r.Context(), maxWait) //per-req context capped by maxWait
+			defer cancel()
+
+			//wait for token or timeout
+			if err := lim.Wait(ctx); err != nil {
+				//timed out or cancel => tell client to retry later
+				setRateHeaders(w, tokensBefore)
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(tokensBefore)))
+				http.Error(w, "Too many requests", http.StatusTooManyRequests)
+				return
 			}
+
+			//token received & consumed => set headers using current tokens & pass through
+			setRateHeaders(w, lim.Tokens())
+			next.ServeHTTP(w, r)
+			return
 		}
-
-		//always expose policy + remaining so clients can self-throttle
-		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(perClientRPS))
-		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(int(math.Floor(remaining))))
-
-		//if no token, tell client to slow down
-		if !allowed {
-			//estimate how long until 1 token becomes available (seconds)
-			waitSeconds := 1 //default
-			if perClientRPS > 0 {
-				need := 1 - tokensBefore
-				if need < 0 {
-					need = 0
-				}
-				//ceil to int no of seconds (never 0)
-				ws := int(math.Ceil(need / float64(perClientRPS)))
-				if ws < 1 {
-					ws = 1
-				}
-				waitSeconds = ws
-			}
-			w.Header().Set("Retry-After", strconv.Itoa(waitSeconds))
+		//non blocking mode: fail fast w 429 when no token available
+		tokensBefore := lim.Tokens()
+		if !lim.Allow() {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(tokensBefore)))
 			http.Error(w, "Too many requests", http.StatusTooManyRequests)
 			return
 		}
-		//if allowed, pass the rew to next handler
+		setRateHeaders(w, lim.Tokens())
 		next.ServeHTTP(w, r)
 	})
 }
@@ -181,10 +200,7 @@ func helloHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
-// creates per client store
-// starts cleanup goroutine to evict idle clients
-// mounts middleware
-// starts server
+// wires everything together & starts the server
 func main() {
 	store := newLimiterStore()
 	store.startCleanup(5*time.Minute, 1*time.Minute)
@@ -194,7 +210,7 @@ func main() {
 	handler := rateLimitMiddleware(store, mux) //wrap mux so every req is checked
 
 	addr := ":8080" //address & port to listen to
-	log.Printf("Server listening on %s (per-client: %drps, burst %d)", addr, perClientRPS, perClientBurst)
+	log.Printf("Server listening on %s (per-client: %drps, burst %d, blocking=%v, maxWait=%s)", addr, perClientRPS, perClientBurst, useBlocking, maxWait)
 
 	//start server
 	log.Fatal(http.ListenAndServe(addr, handler))
