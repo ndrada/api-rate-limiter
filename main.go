@@ -8,25 +8,87 @@ import (
 	"math"     //for Floor/Ceil on token math
 	"net"      //to extract remote ip
 	"net/http" //provides http server and handles primitives
-	"strconv"
-	"strings" //small parsing helpers
-	"sync"    // mutex to protect the map
-	"time"    // timers & timestamps
+	"strconv"  // format header values
+	"strings"  //small parsing helpers
+	"sync"     // mutex to protect the map
+	"time"     // timers & timestamps
 
 	"golang.org/x/time/rate" //token-bucket rate limiter
 )
 
-// per client rate policy
-const (
-	perClientRPS   = 5  //steady tokens/sec
-	perClientBurst = 10 //burst capacity
-)
+// ROUTE LEVEL POLICYY DEFINITIONS
 
-// behavior toggle
-var (
-	useBlocking = true
-	maxWait     = 300 * time.Millisecond //cap for length of wait per req
-)
+type RatePolicy struct {
+	Name        string        //identify policy (used in limiter map key)
+	RPS         int           //steady refill rate (tokens/sec)
+	Burst       int           //short term capacity
+	UseBlocking bool          //toggles blocking vs fast fail
+	MaxWait     time.Duration //caps how long we'll wait in blocking mode
+}
+
+// matches reqs by method + path prefix & assigns a policy
+type RouteRule struct {
+	Method     string     //http method to match (empty = "any")
+	PathPrefix string     //path prefix to match
+	Policy     RatePolicy //policy to apply when rule matches
+}
+
+// for when no rule matches
+var defaultPolicy = RatePolicy{
+	Name:        "default",
+	RPS:         5,
+	Burst:       10,
+	UseBlocking: true,
+	MaxWait:     300 * time.Millisecond,
+}
+
+// ordered list (first match wins; top-down)
+var routeRules = []RouteRule{
+	//string login route
+	{Method: "POST",
+		PathPrefix: "/login",
+		Policy: RatePolicy{
+			Name:        "login",
+			RPS:         1,
+			Burst:       1,
+			UseBlocking: true,
+			MaxWait:     500 * time.Millisecond,
+		},
+	},
+	//heavier endpoint: modest rate
+	{
+		Method:     "POST",
+		PathPrefix: "/heavy",
+		Policy: RatePolicy{
+			Name:        "heavy",
+			RPS:         2,
+			Burst:       4,
+			UseBlocking: false,
+			MaxWait:     0,
+		},
+	},
+	// add extra rules here depending on your api
+}
+
+// picks the first matching rule or returns default
+func selectPolicy(r *http.Request) RatePolicy {
+	//normalized method & path
+	method := r.Method
+	path := r.URL.Path
+
+	for _, rr := range routeRules {
+		if rr.Method != "" && rr.Method != method {
+			continue
+		}
+		if rr.PathPrefix != "" && !strings.HasPrefix(path, rr.PathPrefix) {
+			continue
+		}
+		return rr.Policy
+	}
+	return defaultPolicy
+}
+
+// PER CLIENT LIMITER STORE - keyes by client and policy
 
 // store the limiter & when traffic was last seen for each client
 type clientLimiter struct {
@@ -34,7 +96,7 @@ type clientLimiter struct {
 	lastSeen time.Time //evicts idle clients so map doesn't grow forever
 }
 
-// threadsafe map of clientKey -> clientLimiter
+// threadsafe map of compositeKey -> clientLimiter
 type limiterStore struct {
 	mu      sync.Mutex //guard because handlers run concurrently
 	clients map[string]*clientLimiter
@@ -47,22 +109,30 @@ func newLimiterStore() *limiterStore {
 	}
 }
 
+// combines client identity and policy name to isolat buckets/route
+func keyFor(clientKey string, pol RatePolicy) string {
+	return clientKey + "|" + pol.Name
+}
+
 // returns the limiter for a given client key (created on first use)
 // updates lastSeen so cleanup knows this client is still active
-func (s *limiterStore) get(key string) *rate.Limiter {
+func (s *limiterStore) get(clientKey string, pol RatePolicy) *rate.Limiter {
+	composite := keyFor(clientKey, pol) //composite key
+
+	//locking map while reading/updating
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	//check if a limiter for this key already exists
+	//check if a limiter for this complosite already exists
 	//if yes: refresh last seen & return it
-	if cl, ok := s.clients[key]; ok {
+	if cl, ok := s.clients[composite]; ok {
 		cl.lastSeen = time.Now()
 		return cl.limiter
 	}
 
-	//if no: create a new token-bucket limiter for this client
-	lim := rate.NewLimiter(perClientRPS, perClientBurst)
-	s.clients[key] = &clientLimiter{
+	//if no: create a new limiter with the route's policy
+	lim := rate.NewLimiter(rate.Limit(pol.RPS), pol.Burst)
+	s.clients[composite] = &clientLimiter{
 		limiter:  lim,
 		lastSeen: time.Now(),
 	}
@@ -71,7 +141,7 @@ func (s *limiterStore) get(key string) *rate.Limiter {
 }
 
 // launch background goroutine to periodically remove idle clients
-func (s *limiterStore) startCleanup(idleTTL time.Duration, interval time.Duration) {
+func (s *limiterStore) startCleanup(idleTTL, interval time.Duration) {
 	//background ticker loop
 	go func() {
 		t := time.NewTicker(interval)
@@ -80,7 +150,7 @@ func (s *limiterStore) startCleanup(idleTTL time.Duration, interval time.Duratio
 			//for each tick, scan & delete entries
 			cutoff := time.Now().Add(-idleTTL)
 
-			s.mu.Lock()
+			s.mu.Lock() //scan under lock
 			for key, cl := range s.clients {
 				if cl.lastSeen.Before(cutoff) {
 					delete(s.clients, key)
@@ -91,21 +161,16 @@ func (s *limiterStore) startCleanup(idleTTL time.Duration, interval time.Duratio
 	}()
 }
 
-//extract client identity
-/*
-PRIORITY:
-	1. X-API-Key header (explicit identity)
-	2. X-Forwarded-for (first IP) if behind a proxy
-	3. X-Real-IP
-	4. RemoteAddr IP (direct client)
-*/
+//	EXTRACT CLIENT IDENTITY
+
+// derives the client identity used for per client limits
 func keyFromRequest(r *http.Request) string {
-	// 1 - explicit identity
+	// 1 - explicit API key (best)
 	if apiKey := strings.TrimSpace(r.Header.Get("X-API-Key")); apiKey != "" {
 		return "key:" + apiKey
 	}
 
-	//2 - behind proxy
+	//2 - first ip in X-Forwarded-For (when behind proxy)
 	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
 		parts := strings.Split(xff, ",")
 		if len(parts) > 0 {
@@ -130,87 +195,103 @@ func keyFromRequest(r *http.Request) string {
 	return "ip:" + host
 }
 
-// helper: set standard rate limit headers on the response
-func setRateHeaders(w http.ResponseWriter, tokens float64) {
+// 	HELPERS
+
+// rate limit headers on the response
+func setRateHeaders(w http.ResponseWriter, pol RatePolicy, tokens float64) {
 	if tokens < 0 {
 		tokens = 0
 	}
-	w.Header().Set("X-RateLimit-Limit", strconv.Itoa(perClientRPS))
+	w.Header().Set("X-RateLimit-Limit", strconv.Itoa(pol.RPS))
 	w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(int(math.Floor(tokens))))
 }
 
-// helper: estimate time to wiat for 1 token based on current tokens
-func retryAfterSeconds(tokens float64) int {
+// calculate est time to wait for 1 token based on current tokens
+func retryAfterSeconds(pol RatePolicy, tokens float64) int {
 	need := 1 - tokens
 	if need < 0 {
 		need = 0
 	}
-	if perClientRPS <= 0 {
+	if pol.RPS <= 0 {
 		return 1
 	}
-	sec := int(math.Ceil(need / float64(perClientRPS)))
+	sec := int(math.Ceil(need / float64(pol.RPS)))
 	if sec < 1 {
 		sec = 1
 	}
 	return sec
 }
 
-// middleware: per client limiter w/ 2 behaviors (blockking or fail-fast)
-// + headers (success & 429)
+//	MIDDLEWARE (per client, per route)
+
+// enforces a policy chosen by route for each client
 func rateLimitMiddleware(store *limiterStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := keyFromRequest(r) //figure out which client this req belongs to
-		lim := store.get(key)    //fetch or create limiter for client
+		pol := selectPolicy(r)           //pick route specific policy
+		clientKey := keyFromRequest(r)   //figure out which client this req belongs to
+		lim := store.get(clientKey, pol) //fetch or create limiter for client
 
-		//blocking mode
-		if useBlocking {
-			tokensBefore := lim.Tokens()                             //grab current token estimate beofre making decision
-			ctx, cancel := context.WithTimeout(r.Context(), maxWait) //per-req context capped by maxWait
+		//blocking mode (if policy says block, wait up to Maxwait)
+		if pol.UseBlocking {
+			tokensBefore := lim.Tokens()                                 //grab current token estimate beofre making decision
+			ctx, cancel := context.WithTimeout(r.Context(), pol.MaxWait) //per-req context cappwith policy's MaxWait
 			defer cancel()
 
 			//wait for token or timeout
 			if err := lim.Wait(ctx); err != nil {
 				//timed out or cancel => tell client to retry later
-				setRateHeaders(w, tokensBefore)
-				w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(tokensBefore)))
+				setRateHeaders(w, pol, tokensBefore)
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(pol, tokensBefore)))
 				http.Error(w, "Too many requests", http.StatusTooManyRequests)
 				return
 			}
 
 			//token received & consumed => set headers using current tokens & pass through
-			setRateHeaders(w, lim.Tokens())
+			setRateHeaders(w, pol, lim.Tokens())
 			next.ServeHTTP(w, r)
 			return
 		}
 		//non blocking mode: fail fast w 429 when no token available
 		tokensBefore := lim.Tokens()
 		if !lim.Allow() {
-			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(tokensBefore)))
+			setRateHeaders(w, pol, tokensBefore)
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(pol, tokensBefore)))
 			http.Error(w, "Too many requests", http.StatusTooManyRequests)
 			return
 		}
-		setRateHeaders(w, lim.Tokens())
+		setRateHeaders(w, pol, lim.Tokens())
 		next.ServeHTTP(w, r)
 	})
 }
 
-// for observing throttling behavior
+//	DEMO HANDLERS
+
 func helloHandler(w http.ResponseWriter, r *http.Request) {
-	//success message
 	w.Write([]byte("ok"))
 }
 
-// wires everything together & starts the server
+func heavyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("heavy ok"))
+}
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("login ok"))
+}
+
+// 	SERVER WIRING
+
 func main() {
 	store := newLimiterStore()
 	store.startCleanup(5*time.Minute, 1*time.Minute)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", helloHandler)          //register a single route
+	mux.HandleFunc("/", helloHandler)          //default pol
+	mux.HandleFunc("/heavy", heavyHandler)     // GET /heavy
+	mux.HandleFunc("/login", loginHandler)     // POST /login
 	handler := rateLimitMiddleware(store, mux) //wrap mux so every req is checked
 
 	addr := ":8080" //address & port to listen to
-	log.Printf("Server listening on %s (per-client: %drps, burst %d, blocking=%v, maxWait=%s)", addr, perClientRPS, perClientBurst, useBlocking, maxWait)
+	log.Printf("Server listening on %s (route-level policies enabled)", addr)
 
 	//start server
 	log.Fatal(http.ListenAndServe(addr, handler))
