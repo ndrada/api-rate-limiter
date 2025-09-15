@@ -116,7 +116,7 @@ hey -n 200 -c 20 http://localhost:8080/
 ## Next steps/ideas
 - ~~add blocking mode (use limiter.Wait to delay)~~ **done**
 - ~~route-level configs (different limits per endpoint)~~ **done**
-- metrics for allowed/denied/latency
+- ~~metrics for allowed/denied/latency~~ **done**
 - redis backend ? to share limits across instances
 - maybe turn this into a cli or small library package for drop-in use
 
