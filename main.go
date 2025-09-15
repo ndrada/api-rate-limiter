@@ -14,6 +14,10 @@ import (
 	"time"     // timers & timestamps
 
 	"golang.org/x/time/rate" //token-bucket rate limiter
+
+	//prometheus metrics (counters, histograms, registry + /metrics handler)
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // ROUTE LEVEL POLICYY DEFINITIONS
@@ -88,7 +92,7 @@ func selectPolicy(r *http.Request) RatePolicy {
 	return defaultPolicy
 }
 
-// PER CLIENT LIMITER STORE - keyes by client and policy
+// PER CLIENT LIMITER STORE - keyed by client and policy
 
 // store the limiter & when traffic was last seen for each client
 type clientLimiter struct {
@@ -222,14 +226,56 @@ func retryAfterSeconds(pol RatePolicy, tokens float64) int {
 	return sec
 }
 
+// PROMETHEUS METRICS
+
+var (
+	metricsReqTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "api",
+			Subsystem: "ratelimit",
+			Name:      "requests_total",
+			Help:      " Total requests seen by middleware",
+		},
+		[]string{"policy", "method", "outcome"},
+	)
+
+	metricsReqDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "api",
+			Subsystem: "ratelimit",
+			Name:      "request_duration_seconds",
+			Help:      "End-to-end request duration measure by middleware",
+			Buckets:   prometheus.DefBuckets, // default
+		},
+		[]string{"policy", "method", "outcome"},
+	)
+
+	metricsInFlight = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "api",
+			Subsystem: "ratelimit",
+			Name:      "in_flight_requests",
+			Help:      "Number of in-flight requests passing through the wrapped handler",
+		},
+	)
+)
+
+// registers collectors w default registry
+func initMetrics() {
+	prometheus.MustRegister(metricsReqTotal, metricsReqDuration, metricsInFlight)
+}
+
 //	MIDDLEWARE (per client, per route)
 
-// enforces a policy chosen by route for each client
+// enforces a policy chosen by route for each client & emits metrics
 func rateLimitMiddleware(store *limiterStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		pol := selectPolicy(r)           //pick route specific policy
 		clientKey := keyFromRequest(r)   //figure out which client this req belongs to
 		lim := store.get(clientKey, pol) //fetch or create limiter for client
+
+		start := time.Now()  //for latency
+		outcome := "allowed" //optimistic default
 
 		//blocking mode (if policy says block, wait up to Maxwait)
 		if pol.UseBlocking {
@@ -243,24 +289,49 @@ func rateLimitMiddleware(store *limiterStore, next http.Handler) http.Handler {
 				setRateHeaders(w, pol, tokensBefore)
 				w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(pol, tokensBefore)))
 				http.Error(w, "Too many requests", http.StatusTooManyRequests)
+
+				//record metrics for timeout path
+				metricsReqTotal.WithLabelValues(pol.Name, r.Method, outcome).Inc()
+				metricsReqDuration.WithLabelValues(pol.Name, r.Method, outcome).
+					Observe(time.Since(start).Seconds())
 				return
 			}
 
 			//token received & consumed => set headers using current tokens & pass through
 			setRateHeaders(w, pol, lim.Tokens())
+			metricsInFlight.Inc()
 			next.ServeHTTP(w, r)
+			metricsInFlight.Dec()
+
+			metricsReqTotal.WithLabelValues(pol.Name, r.Method, outcome).Inc()
+			metricsReqDuration.WithLabelValues(pol.Name, r.Method, outcome).
+				Observe(time.Since(start).Seconds())
 			return
 		}
+
 		//non blocking mode: fail fast w 429 when no token available
 		tokensBefore := lim.Tokens()
 		if !lim.Allow() {
+			outcome = "denied"
 			setRateHeaders(w, pol, tokensBefore)
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(pol, tokensBefore)))
 			http.Error(w, "Too many requests", http.StatusTooManyRequests)
+
+			metricsReqTotal.WithLabelValues(pol.Name, r.Method, outcome).Inc()
+			metricsReqDuration.WithLabelValues(pol.Name, r.Method, outcome).
+				Observe(time.Since(start).Seconds())
 			return
 		}
+
+		//set headers, run handler, record metrics
 		setRateHeaders(w, pol, lim.Tokens())
+		metricsInFlight.Inc()
 		next.ServeHTTP(w, r)
+		metricsInFlight.Dec()
+
+		metricsReqTotal.WithLabelValues(pol.Name, r.Method, outcome).Inc()
+		metricsReqDuration.WithLabelValues(pol.Name, r.Method, outcome).
+			Observe(time.Since(start).Seconds())
 	})
 }
 
@@ -281,13 +352,16 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 // 	SERVER WIRING
 
 func main() {
+	initMetrics()
+
 	store := newLimiterStore()
 	store.startCleanup(5*time.Minute, 1*time.Minute)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", helloHandler)          //default pol
-	mux.HandleFunc("/heavy", heavyHandler)     // GET /heavy
-	mux.HandleFunc("/login", loginHandler)     // POST /login
+	mux.HandleFunc("/", helloHandler)      //default pol
+	mux.HandleFunc("/heavy", heavyHandler) // GET /heavy
+	mux.HandleFunc("/login", loginHandler) // POST /login
+	mux.Handle("/metrics", promhttp.Handler())
 	handler := rateLimitMiddleware(store, mux) //wrap mux so every req is checked
 
 	addr := ":8080" //address & port to listen to
